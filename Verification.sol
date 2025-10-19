@@ -1,61 +1,89 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-// Import thư viện ECDSA từ OpenZeppelin để dùng hàm recover
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+/**
+ * Verification.sol — Hợp đồng xác minh chứng chỉ
+ * ------------------------------------------------
+ * 📌 Mục tiêu:
+ *  - Doanh nghiệp nhập: certHash, issuerExpected, signature
+ *  - Hệ thống kiểm: certHash đã đăng ký? issuer có khớp? chữ ký có do issuer ký?
+ *  - Trả về: true/false (đúng/sai), không ghi trạng thái on-chain
+ *
+ * ⚠️ Ký theo EIP-191 (signMessage) => dùng toEthSignedMessageHash trước khi recover.
+ */
 
-// Khai báo giao diện (Interface) để gọi hàm từ Hợp đồng Certificate.sol
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+// (MỚI) OpenZeppelin v5 tách toEthSignedMessageHash sang MessageHashUtils
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+
+/**
+ * Giao tiếp tối thiểu với Certificate.sol:
+ * - certificates(certHash) trả về (student, issuer, isRegistered)
+ *   để ta đối chiếu issuer & tình trạng đăng ký.
+ */
 interface ICertificate {
-    // Định nghĩa hàm mapping (view function) để lấy dữ liệu chứng chỉ
-    function certificates(bytes32 _certHash) 
-        external 
-        view 
+    function certificates(bytes32 certHash)
+        external
+        view
         returns (address studentAddress, address issuerAddress, bool isRegistered);
 }
 
-/**
- * @title Verification
- * @dev Hợp đồng cho phép doanh nghiệp xác minh chứng chỉ dựa trên hash, issuer và chữ ký.
- */
 contract Verification {
-    using ECDSA for bytes32; 
-    
-    ICertificate public certContract;
+    using ECDSA for bytes32;
+    // (MỚI) enable certHash.toEthSignedMessageHash()
+    using MessageHashUtils for bytes32;
 
-    constructor(address _certificateContractAddress) {
-        // Thiết lập liên kết đến hợp đồng Certificate đã triển khai
-        certContract = ICertificate(_certificateContractAddress);
+    /// Địa chỉ hợp đồng Certificate đã triển khai (immutable để tiết kiệm gas)
+    ICertificate public immutable certContract;
+
+    constructor(address certificateContractAddress) {
+        require(certificateContractAddress != address(0), "Zero certificate addr");
+        certContract = ICertificate(certificateContractAddress);
     }
 
     /**
-     * @dev Hàm chính để xác minh tính hợp lệ của Chứng chỉ.
-     * @param _certHash Hash của chứng chỉ.
-     * @param _issuerExpected Địa chỉ của trường mà sinh viên khẳng định phát hành.
-     * @param _signature Chữ ký điện tử của Issuer trên mã hash chứng chỉ.
-     * @return isVerified True nếu chứng chỉ hợp lệ.
+     * @notice Xác minh chứng chỉ dựa trên hash, issuer kỳ vọng và chữ ký của issuer.
+     * @param certHash        Hash (bytes32) của nội dung chứng chỉ (đã chuẩn hoá & keccak256 off-chain)
+     * @param issuerExpected  Địa chỉ ví trường phát hành mà bên xác minh kỳ vọng
+     * @param signature       Chữ ký ECDSA do issuer ký trên certHash theo EIP-191 (signMessage)
+     * @return isValid        true nếu hợp lệ; false nếu chữ ký không khớp (các lỗi dữ liệu sẽ revert)
+     *
+     * Quy trình:
+     * 1) Lấy (student, issuer, isRegistered) từ Certificate bằng certHash.
+     * 2) Yêu cầu certHash đã đăng ký & issuer trong sổ cái == issuerExpected.
+     * 3) Tạo messageHash chuẩn EIP-191 từ certHash rồi recover signer từ signature.
+     * 4) Hợp lệ nếu recoveredSigner == issuerExpected.
      */
     function verifyCertificate(
-        bytes32 _certHash,
-        address _issuerExpected,
-        bytes memory _signature
-    ) public view returns (bool isVerified) {
-        // Lấy dữ liệu đã đăng ký từ hợp đồng Certificate.sol
-        (address registeredStudent, address registeredIssuer, bool isRegistered) = certContract.certificates(_certHash);
+        bytes32 certHash,
+        address issuerExpected,
+        bytes calldata signature
+    ) external view returns (bool isValid) {
+        (, address issuerOnChain, bool isRegistered) = certContract.certificates(certHash);
 
-        // 1. Kiểm tra Hash và Issuer
-        require(isRegistered, "Certificate hash not registered (Invalid hash or not issued)");
-        require(registeredIssuer == _issuerExpected, "Registered Issuer mismatch (Issuer address is wrong)");
+        // 1) certHash phải tồn tại trong sổ cái phát hành
+        require(isRegistered, "Certificate: hash not registered");
 
-        // 2. KHỐI LỆNH ĐÃ SỬA: Xác minh Chữ ký
-        // Tách quá trình xử lý hash thành hai bước để tránh lỗi cú pháp:
-        
-        // 2a. Tạo hash có tiền tố theo chuẩn Ethereum (EIP-191)
-        bytes32 messageHash = ECDSA.toEthSignedMessageHash(_certHash);
-        
-        // 2b. Phục hồi địa chỉ người ký bằng messageHash
-        address recoveredSigner = ECDSA.recover(messageHash, _signature);
-        
-        // 3. Kết luận: Chữ ký phải được ký bởi đúng Issuer đã đăng ký.
-        return recoveredSigner == _issuerExpected;
+        // 2) Issuer trong sổ cái phải khop issuerExpected
+        require(issuerOnChain == issuerExpected, "Certificate: issuer mismatch");
+
+        // 3) Xac minh chu ky (EIP-191): signMessage(arrayify(certHash))
+        bytes32 messageHash = certHash.toEthSignedMessageHash(); // <— ĐÃ ĐỔI
+        address recoveredSigner = ECDSA.recover(messageHash, signature);
+
+        // 4) Kết luận
+        return (recoveredSigner == issuerExpected);
+    }
+
+    /**
+     * @notice Tiện ích: trả ra địa chỉ đã ký (phục vụ debug client).
+     * @dev Không đụng tới Certificate, chỉ recover từ certHash + signature.
+     */
+    function recoverSigner(bytes32 certHash, bytes calldata signature)
+        external
+        pure
+        returns (address)
+    {
+        return ECDSA.recover(certHash.toEthSignedMessageHash(), signature); // <— ĐÃ ĐỔI
     }
 }
